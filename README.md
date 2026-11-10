@@ -121,6 +121,20 @@ and ~7 GB of RAM. It takes ~10 minutes for the full corpus.
 
 ## Training
 
+**Environment pin (important).** The model's remote code is transformers 4.x
+code: it imports `HybridCache`, `LossKwargs` and `ROPE_INIT_FUNCTIONS["default"]`,
+all removed in transformers 5.x. Kaggle ships 5.20.2, so the notebooks first
+install:
+
+```
+transformers==4.53.2  huggingface_hub==0.36.2  tokenizers==0.21.4  peft==0.17.1
+```
+
+and load the weights into a **dot-free local directory**
+(`snapshot_download(..., local_dir="/kaggle/working/model")`) — the repo id
+`4BA0.6B` breaks the dynamic-module path in 4.x. Rendering was verified
+byte-identical between 4.53.2 and 5.20.2 across 150 conversations.
+
 See `DESIGN.md` §4. Short version: LoRA r=8 / α=16 on q,k,v,o, fp16, batch 1
 per GPU × grad-accum 8, SDPA attention, `logits_to_keep` restricted to the
 target span. The trainer lives in `scripts/train_smallthinker.py` and the

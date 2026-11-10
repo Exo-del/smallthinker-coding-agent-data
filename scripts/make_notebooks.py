@@ -16,6 +16,25 @@ def code(text):
             "outputs": [], "source": text.splitlines(keepends=True)}
 
 
+NOTIFY_CELL = '''# push progress to ntfy so the run can be followed without opening Kaggle
+import urllib.request
+
+NTFY_URL = "https://ntfy.sh/amine-opencode-d86756a5"
+
+def notify(msg, prio="default"):
+    try:
+        req = urllib.request.Request(
+            NTFY_URL, data=msg.encode("utf-8"),
+            headers={"Title": "SmallThinker Kaggle", "Priority": prio})
+        urllib.request.urlopen(req, timeout=8).read()
+        print("[ntfy]", msg)
+    except Exception as exc:
+        print("[ntfy failed]", exc)
+
+notify("notebook started")
+'''
+
+
 def notebook(cells):
     return {
         "cells": cells,
@@ -65,15 +84,25 @@ import subprocess
 print("nvidia-smi:")
 print(subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout)
 """),
-    code("""!pip install -q peft 2>&1 | tail -3
-import peft, transformers
-print("peft:", peft.__version__, "| transformers:", transformers.__version__)
+    code(NOTIFY_CELL),
+    code("""# Tiiny/SmallThinker-4BA0.6B-Instruct is a transformers 4.x model: its remote
+# code imports HybridCache, LossKwargs and ROPE_INIT_FUNCTIONS["default"], all of
+# which transformers 5.x removed.  Pin the 4.x stack, and load the weights from a
+# dot-free local directory because the repo id (4BA0.6B) breaks the dynamic
+# module path in 4.x.
+!pip install -q "transformers==4.53.2" "huggingface_hub==0.36.2" "tokenizers==0.21.4" "peft==0.17.1" 2>&1 | tail -3
+import peft, transformers, huggingface_hub
+print("peft:", peft.__version__, "| transformers:", transformers.__version__, "| hub:", huggingface_hub.__version__)
+
+from huggingface_hub import snapshot_download
+MODEL_ID = "Tiiny/SmallThinker-4BA0.6B-Instruct"
+MODEL = snapshot_download(MODEL_ID, local_dir="/kaggle/working/model")
+print("model files:", MODEL)
 """),
     code("""import torch
 from transformers import AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 
-MODEL = "Tiiny/SmallThinker-4BA0.6B-Instruct"
 print("loading base model ...", flush=True)
 t0 = time.time()
 base = AutoModelForCausalLM.from_pretrained(
@@ -124,6 +153,7 @@ for seq, tgt in [(1024, 512), (2048, 512), (2048, 1024), (3072, 1024), (3072, 25
     try:
         r = bench(seq, tgt)
         results.append(r); print(r, flush=True)
+        notify(f"probe seq={seq} target={tgt}: peak {r['peak_gib']} GiB, {r['step_s']}s/step")
     except RuntimeError as e:
         print(f"seq={seq} target={tgt} FAILED: {e}", flush=True)
         results.append({"seq": seq, "target": tgt, "error": str(e)[:200]})
@@ -134,6 +164,7 @@ print(json.dumps(results, indent=2))
 with open("/kaggle/working/probe_results.json", "w") as f:
     json.dump(results, f, indent=2)
 print("PROBE COMPLETE")
+notify("probe complete: " + ", ".join(f"{r.get('seq')}/{r.get('target')}={r.get('peak_gib','FAIL')}GiB" for r in results), prio="high")
 """),
     md("""Read `probe_results.json`. Pick the largest `seq` whose `peak_gib` stays
 below ~13.5 GiB and use it as `SEQ_LEN` in the training notebook.  If every
@@ -177,9 +208,20 @@ for i in range(torch.cuda.device_count()):
     print(f"  gpu{i}: {p.name} {p.total_memory/1024**3:.2f} GiB")
 print(subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout)
 """),
-    code("""!pip install -q peft 2>&1 | tail -3
-import peft, transformers
-print("peft:", peft.__version__, "transformers:", transformers.__version__)
+    code(NOTIFY_CELL),
+    code("""# Tiiny/SmallThinker-4BA0.6B-Instruct is a transformers 4.x model: its remote
+# code imports HybridCache, LossKwargs and ROPE_INIT_FUNCTIONS["default"], all of
+# which transformers 5.x removed.  Pin the 4.x stack, and load the weights from a
+# dot-free local directory because the repo id (4BA0.6B) breaks the dynamic
+# module path in 4.x.
+!pip install -q "transformers==4.53.2" "huggingface_hub==0.36.2" "tokenizers==0.21.4" "peft==0.17.1" 2>&1 | tail -3
+import peft, transformers, huggingface_hub
+print("peft:", peft.__version__, "| transformers:", transformers.__version__, "| hub:", huggingface_hub.__version__)
+
+from huggingface_hub import snapshot_download
+MODEL_ID = "Tiiny/SmallThinker-4BA0.6B-Instruct"
+MODEL = snapshot_download(MODEL_ID, local_dir="/kaggle/working/model")
+print("model files:", MODEL)
 """),
     code("""REPO = "https://github.com/Exo-del/smallthinker-coding-agent-data.git"
 DATA_DIR = "/kaggle/working/smallthinker-coding-agent-data"
@@ -194,10 +236,11 @@ print(sorted(os.listdir(DATA_DIR)))
 manifest = json.load(open(f"{DATA_DIR}/manifest.json"))
 print(json.dumps(manifest["totals"], indent=2))
 print(json.dumps(manifest["mixture_by_category"], indent=2))
+notify("data cloned: %d convs / %.1fM target tokens" % (
+    manifest["totals"]["conversations"], manifest["totals"]["target_tokens"]/1e6))
 """),
     code("""# configuration - SEQ_LEN must match what the probe showed fits in memory
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "3072"))
-MODEL = "Tiiny/SmallThinker-4BA0.6B-Instruct"
 REPO_DIR = "/kaggle/working/smallthinker-coding-agent-data"
 ARR_DIR = "/kaggle/working/arrays"
 
@@ -224,6 +267,7 @@ r = subprocess.run(
 print(r.stdout[-6000:]); print(r.stderr[-4000:])
 assert r.returncode == 0, "build_examples failed"
 print("built in %.0fs" % (time.time()-t0))
+notify("tokenised arrays built in %.0f min" % ((time.time()-t0)/60))
 print(json.load(open(f"{ARR_DIR}/dataset_summary.json"))["totals"] if os.path.exists(f"{ARR_DIR}/dataset_summary.json") else "")
 """),
     code("""# smoke test: 12 optimizer steps on a single GPU, watching memory and loss
@@ -238,6 +282,7 @@ smoke = subprocess.run(
 print(smoke.stdout[-8000:]); print(smoke.stderr[-4000:])
 assert smoke.returncode == 0, "smoke test failed"
 print("SMOKE TEST OK")
+notify("smoke test OK - starting full DDP run", prio="high")
 """),
     code("""# full DDP run over both T4s
 os.makedirs("/kaggle/working/train_out", exist_ok=True)
@@ -258,6 +303,8 @@ t0 = time.time()
 with open("/kaggle/working/train.log", "w") as log:
     proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
 print("exit code:", proc.returncode, "elapsed: %.0f s" % (time.time()-t0))
+notify("training finished (exit %d) after %.1f h" % (proc.returncode, (time.time()-t0)/3600),
+       prio="high" if proc.returncode == 0 else "urgent")
 print(open("/kaggle/working/train.log").read()[-8000:])
 """),
     code("""# package the adapter as the notebook output
@@ -276,6 +323,7 @@ with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
             p = os.path.join(root, fn)
             z.write(p, os.path.relpath(p, os.path.dirname(adapter_dir)))
 print("zip size: %.1f MB" % (os.path.getsize(out_zip)/1e6))
+notify("adapter zipped: %.1f MB" % (os.path.getsize(out_zip)/1e6))
 print(open("/kaggle/working/train_out/run_summary.json").read() if os.path.exists("/kaggle/working/train_out/run_summary.json") else "no run summary")
 """),
     code("""# quick qualitative check: does the adapter now think and call tools?
