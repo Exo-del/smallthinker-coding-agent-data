@@ -40,14 +40,16 @@ def iter_conversations(data_dir: Path, split: str):
 def build_split(tok, data_dir: Path, split: str, out_dir: Path, seq_len: int,
                 prefix: str, log_every: int = 2000) -> dict:
     convs = list(iter_conversations(data_dir, split))
-    print(f"[{split}] {len(convs)} conversations", flush=True)
+    n_turns = sum(len(c.get("meta", {}).get("turns", [])) for c in convs)
+    print(f"[{split}] {len(convs)} conversations / {n_turns} turns", flush=True)
 
     ids_out = out_dir / f"{prefix}_input_ids.npy"
     lab_out = out_dir / f"{prefix}_labels.npy"
     len_out = out_dir / f"{prefix}_lengths.npy"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_max = len(convs) * 4 + 1024
+    # exact upper bound: one row per assistant turn (plus slack for re-runs)
+    n_max = n_turns + 64
     x = np.lib.format.open_memmap(ids_out, mode="w+", dtype=np.int32, shape=(n_max, seq_len))
     y = np.lib.format.open_memmap(lab_out, mode="w+", dtype=np.int32, shape=(n_max, seq_len))
     lengths = np.zeros(n_max, dtype=np.int32)
@@ -135,6 +137,9 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     data_dir = Path(args.data_dir)
+    # accept either the repo root (which contains data/) or data/ itself
+    if (data_dir / "data").is_dir():
+        data_dir = data_dir / "data"
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

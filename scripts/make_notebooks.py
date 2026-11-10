@@ -279,20 +279,21 @@ print("zip size: %.1f MB" % (os.path.getsize(out_zip)/1e6))
 print(open("/kaggle/working/train_out/run_summary.json").read() if os.path.exists("/kaggle/working/train_out/run_summary.json") else "no run summary")
 """),
     code("""# quick qualitative check: does the adapter now think and call tools?
-import torch, json
+import torch, json, os, glob
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
-ADAPTER = "/kaggle/working/smallthinker-coding-agent-data-adapter"
+if not os.path.isdir(adapter_dir):
+    cands = sorted(glob.glob("/kaggle/working/train_out/checkpoints/step_*"))
+    adapter_dir = cands[-1] if cands else ""
+assert os.path.isdir(adapter_dir), "no adapter found - did training finish?"
+
 tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(MODEL, trust_remote_code=True,
                                              torch_dtype=torch.float16,
                                              attn_implementation="sdpa").to("cuda:0")
-try:
-    from peft import PeftModel
-    model = PeftModel.from_pretrained(model, adapter_dir)
-    print("adapter loaded")
-except Exception as e:
-    print("could not load adapter:", repr(e))
+model = PeftModel.from_pretrained(model, adapter_dir)
+print("adapter loaded from", adapter_dir)
 model.eval()
 
 TOOLS = [{"type": "function", "function": {"name": "read_file", "description": "Read a file from the project.",
