@@ -106,11 +106,11 @@ def build_split(tok, data_dir: Path, split: str, out_dir: Path, seq_len: int,
 
     x.flush()
     y.flush()
-    # trim the memmaps to the used length
     del x, y
-    x2 = np.lib.format.open_memmap(ids_out, mode="r+", dtype=np.int32, shape=(n_max, seq_len))
-    x2.flush()
-    del x2
+    # Rows past n were never written; the trainer filters them out by
+    # dropping every zero-length entry, and because writes are sequential the
+    # surviving indices still line up with the memmaps.
+    np.save(len_out, lengths)
     print(f"[{split}] wrote {n} examples "
           f"(skipped long={skipped_long}, bad={skipped_bad})", flush=True)
     return {
