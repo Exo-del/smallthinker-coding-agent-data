@@ -47,7 +47,41 @@ def parse_args():
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--attn", default="sdpa")
+    p.add_argument("--grad-checkpoint", type=int, default=1)
     return p.parse_args()
+
+
+def enable_layer_checkpointing(base) -> int:
+    """Wrap every decoder layer in a non-reentrant checkpoint.
+
+    The shipped implementation advertises ``supports_gradient_checkpointing =
+    False`` only because it never threads ``self._gradient_checkpointing_func``
+    through ``SmallThinkerModel.forward``.  Wrapping the layers directly is
+    equivalent and drops activation memory from O(n_layers x seq_len) to
+    O(seq_len) plus one layer's worth during the recompute, which is what makes
+    a 3072-token window fit on a 15 GiB T4.
+    """
+    import torch.utils.checkpoint as ck
+
+    layers = getattr(getattr(base, "model", None), "layers", None)
+    if layers is None:
+        raise RuntimeError("could not find decoder layers on the loaded model")
+
+    for layer in layers:
+        if getattr(layer, "_ckpt_patched", False):
+            continue
+        orig = layer.forward
+
+        def make(forward_fn):
+            def checkpointed(*args, **kwargs):
+                # The cache is unused in training and is not a tensor.
+                kwargs.pop("past_key_value", None)
+                return ck.checkpoint(forward_fn, *args, use_reentrant=False, **kwargs)
+            return checkpointed
+
+        layer.forward = make(orig)
+        layer._ckpt_patched = True
+    return len(layers)
 
 
 class MemmapDataset(Dataset):
@@ -112,7 +146,7 @@ def main():
 
     if is_main:
         print(f"world_size={world_size}; local_rank={local_rank}; GPU={torch.cuda.get_device_name(local_rank)}", flush=True)
-        print("Loading base model in FP16; gradient checkpointing intentionally disabled (unsupported by this model implementation).", flush=True)
+        print("Loading base model in FP16.", flush=True)
 
     base = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -125,6 +159,11 @@ def main():
     base.config.use_cache = False
     if hasattr(base, "generation_config"):
         base.generation_config.use_cache = False
+
+    if args.grad_checkpoint:
+        n_ck = enable_layer_checkpointing(base)
+        if is_main:
+            print(f"activation checkpointing enabled on {n_ck} decoder layers", flush=True)
 
     if args.resume:
         if is_main: print("Loading trainable adapter:", args.resume, flush=True)

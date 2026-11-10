@@ -95,9 +95,24 @@ import peft, transformers, huggingface_hub
 print("peft:", peft.__version__, "| transformers:", transformers.__version__, "| hub:", huggingface_hub.__version__)
 
 from huggingface_hub import snapshot_download
+import pathlib
 MODEL_ID = "Tiiny/SmallThinker-4BA0.6B-Instruct"
 MODEL = snapshot_download(MODEL_ID, local_dir="/kaggle/working/model")
 print("model files:", MODEL)
+
+# The MoE router normalises its sigmoid weights in place:
+#     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+# which autograd rejects ("modified by an inplace operation") because the
+# division's backward needs the pre-division tensor.  Rewrite it out of place.
+_mp = pathlib.Path(MODEL) / "modeling_smallthinker.py"
+_src = _mp.read_text()
+_bad = "routing_weights /= routing_weights.sum(dim=-1, keepdim=True)"
+_good = "routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)"
+if _bad in _src:
+    _mp.write_text(_src.replace(_bad, _good))
+    print("patched in-place router normalisation -> out of place")
+else:
+    print("router patch not needed (upstream changed)")
 """),
     code("""import torch
 from transformers import AutoModelForCausalLM
@@ -124,7 +139,39 @@ model.print_trainable_parameters()
     code("""import torch, torch.nn.functional as F, time
 
 model.train()
-model.gradient_checkpointing_disable()
+
+# Manual activation checkpointing.  The model reports
+# supports_gradient_checkpointing=False only because it never wires up
+# self._gradient_checkpointing_func; wrapping each decoder layer is equivalent
+# and cuts activation memory from O(n_layers x seq) to O(seq).
+import torch.utils.checkpoint as _ck
+
+def find_layers(m):
+    node = m
+    for _ in range(6):
+        if hasattr(node, "layers"):
+            return node.layers
+        node = getattr(node, "model", None)
+        if node is None:
+            break
+    raise RuntimeError("decoder layers not found")
+
+def enable_layer_checkpointing(m):
+    layers = find_layers(m)
+    for layer in layers:
+        if getattr(layer, "_ckpt_patched", False):
+            continue
+        orig = layer.forward
+        def make(forward_fn):
+            def checkpointed(*args, **kwargs):
+                kwargs.pop("past_key_value", None)
+                return _ck.checkpoint(forward_fn, *args, use_reentrant=False, **kwargs)
+            return checkpointed
+        layer.forward = make(orig)
+        layer._ckpt_patched = True
+    return len(layers)
+
+print("checkpointed layers:", enable_layer_checkpointing(model))
 
 def bench(seq_len, target_len, steps=6):
     torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(0)
@@ -149,7 +196,7 @@ def bench(seq_len, target_len, steps=6):
             "step_s": round(sum(times[2:])/max(1,len(times[2:])),3), "loss": round(float(loss),3)}
 
 results = []
-for seq, tgt in [(1024, 512), (2048, 512), (2048, 1024), (3072, 1024), (3072, 2560)]:
+for seq, tgt in [(2048, 512), (3072, 512), (3072, 1536), (3072, 2560), (4096, 1536)]:
     try:
         r = bench(seq, tgt)
         results.append(r); print(r, flush=True)
@@ -219,9 +266,24 @@ import peft, transformers, huggingface_hub
 print("peft:", peft.__version__, "| transformers:", transformers.__version__, "| hub:", huggingface_hub.__version__)
 
 from huggingface_hub import snapshot_download
+import pathlib
 MODEL_ID = "Tiiny/SmallThinker-4BA0.6B-Instruct"
 MODEL = snapshot_download(MODEL_ID, local_dir="/kaggle/working/model")
 print("model files:", MODEL)
+
+# The MoE router normalises its sigmoid weights in place:
+#     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+# which autograd rejects ("modified by an inplace operation") because the
+# division's backward needs the pre-division tensor.  Rewrite it out of place.
+_mp = pathlib.Path(MODEL) / "modeling_smallthinker.py"
+_src = _mp.read_text()
+_bad = "routing_weights /= routing_weights.sum(dim=-1, keepdim=True)"
+_good = "routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)"
+if _bad in _src:
+    _mp.write_text(_src.replace(_bad, _good))
+    print("patched in-place router normalisation -> out of place")
+else:
+    print("router patch not needed (upstream changed)")
 """),
     code("""REPO = "https://github.com/Exo-del/smallthinker-coding-agent-data.git"
 DATA_DIR = "/kaggle/working/smallthinker-coding-agent-data"

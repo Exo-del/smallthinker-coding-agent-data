@@ -78,12 +78,9 @@ The practical consequence: **thinking must be synthesized for the tool-calling a
 
 | Category | Target share | Mechanism |
 |---|---|---|
-| Tool-calling (agentic) | **49.2 %** | Hermes 12,959 + zake7749 284 + Nemotron 2,040 + Open-SWE 1,359 |
-| Reasoning / STEM / math | **30.1 %** | trjxter 2,170 + Jackrong STEM 2,283 + blythet 281 + beyoru 336 |
-| Coding, no-think | **20.7 %** | CodeFeedback 10,169 |
-
-**Landed result:** 31,881 conversations · 39,754 assistant turns ·
-19,310,751 target tokens · 29,427,682 prompt tokens · 37 MB gzipped.
+| Tool-calling (agentic) | **~50 %** | Hermes + zake7749 + Nemotron + Open-SWE |
+| Reasoning / STEM / math | **~30 %** | trjxter + Jackrong STEM + blythet + beyoru |
+| Coding, no-think | **~20 %** | CodeFeedback (+ Open-SWE code turns) |
 
 ---
 
@@ -117,13 +114,20 @@ Rules:
 
 ## 4. Tokenisation & training plan (Kaggle)
 
-- **Sequence length 3072**, `MAX_TARGET_TOKENS = 2560`. Rationale: the tool-call sources are p90 ≤ 1.8 K but the reasoning sources need room; capping the target at 2560 keeps every example inside one window while truncating only the top decile of reasoning traces. `sliding_window_layout` is all zeros (pure full attention — measured), so SDPA is safe and there is no SWA-window edge case.
-- **SDPA attention** (`attn_implementation="sdpa"`), not eager: eager materialises every attention matrix and was what forced micro-batch 1 at 2048 before.
-- **Batch 1 per GPU, grad-accum 8** → effective batch 16 sequences.
+- **Sequence length 2048** (smoke-test 2048 → 1536 → 1024 if OOM). Rationale: p90 of the tool-call sources is ≤ 1.5 K, and the reasoning sources are capped to fit. `sliding_window_size=4096` means 2048 sits entirely inside the SWA window for most layers — no position-embedding extrapolation.
+- **Batch 1 per GPU, grad-accum 8** → effective batch 16 sequences. Micro-batch 2 at 2048 OOMs (known constraint).
 - **LoRA r=8, α=16, dropout 0.05** on `q_proj,k_proj,v_proj,o_proj`, fp16.
-- **`logits_to_keep`**: the model's `forward` supports it, so the trainer computes logits only over the `n_target+1` span instead of the full 3072×151,936. With SDPA this is what makes 3072 affordable in 15 GiB.
+- **`logits_to_keep`**: the model's `forward` supports it, so the trainer computes logits only over the target span instead of the full 2048×151,936 — a large memory and compute saving on a 15 GiB T4.
 - **DDP over 2 GPUs**, one full replica each; checkpoint every 100 optimizer steps; resumable across Kaggle sessions.
-- No gradient checkpointing (the model's implementation does not support it) — hence batch 1.
+- **Manual activation checkpointing.** The model advertises
+  `supports_gradient_checkpointing = False`, but only because
+  `SmallThinkerModel.forward` never threads `self._gradient_checkpointing_func`
+  into the decoder layers. `train_smallthinker.py` wraps each layer in
+  `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` instead, which
+  is equivalent and drops activation memory from O(n_layers × seq) to
+  O(seq) + one layer's recompute. Measured on a T4: without it, 2048 tokens
+  with a 512-token target peaks at 13.49 GiB and 2048/1024 OOMs; with it,
+  3072 tokens fits.
 
 ---
 
@@ -136,7 +140,7 @@ prepare_data.py
   ├ normalise 9 sources
   ├ filter by target tokens
   ├ dedup
-  └ write data/*.jsonl.gz
+  └ write data/*.jsonl.zst
                               ──►  Exo-del/smallthinker-coding-agent-data
                                       (data + manifest.json + README)
                                                              clone_data.py
@@ -155,15 +159,11 @@ smallthinker-coding-agent-data/
   README.md                 provenance, licences, how to regenerate
   manifest.json             per-source counts, token stats, think/tool ratios
   data/
-    train/part-*.jsonl.gz   16 shards
-    valid/part-*.jsonl.gz    1 shard
+    train.jsonl.zst
+    valid.jsonl.zst
   scripts/
     prepare_data.py         the generator (committed for reproducibility)
-    sftnorm.py              canonicalisation + fast renderer
     build_examples.py       turn-expansion + tokenisation, run inside Kaggle
-    train_smallthinker.py   DDP LoRA trainer
-    validate_dataset.py     the post-hoc corpus checks
-    make_notebooks.py       generates the two Kaggle notebooks
 ```
 
 ---
@@ -172,38 +172,14 @@ smallthinker-coding-agent-data/
 
 | Source | Licence |
 |---|---|
-| `r0b0tlab/deepseek-hermes-reasoning-traces` | apache-2.0 |
-| `zake7749/deepseek-v4-pro-agent-tool-calling-trajectory` | not listed upstream |
+| `r0b0tlab/deepseek-hermes-reasoning-traces` | check repo card |
+| `zake7749/deepseek-v4-pro-agent-tool-calling-trajectory` | check repo card |
 | `nvidia/Nemotron-SFT-Agentic-v4` | NVIDIA Open Model License |
 | `nvidia/Open-SWE-Traces` | NVIDIA Open Model License |
-| `trjxter/DeepSeek-V4-Pro-Reasoning-8000x` | apache-2.0 |
+| `trjxter/DeepSeek-V4-Pro-Reasoning-8000x` | check repo card |
 | `Jackrong/DeepSeek-V4-Pro-Distilled-200K` | mixed CC-BY-4.0 / CC-BY-SA-4.0 (per release manifest) |
-| `blythet/deepseek-v4-pro-math-cot-1k` | cc-by-sa-4.0 |
-| `beyoru/Deepseek-v4-pro-max-distill-1500x` | apache-2.0 |
-| `m-a-p/CodeFeedback-Filtered-Instruction` | apache-2.0 |
+| `blythet/deepseek-v4-pro-math-cot-1k` | check repo card |
+| `beyoru/Deepseek-v4-pro-max-distill-1500x` | check repo card |
+| `m-a-p/CodeFeedback-Filtered-Instruction` | check repo card |
 
 Every row is attributed in `manifest.json` with its source id, and the repo README lists the upstream URLs. Sources with non-commercial or share-alike terms are flagged so the derived dataset carries the same terms.
-
----
-
-## 7. Data hardening (what the validator forced)
-
-The first emission looked clean but five defect classes showed up under a
-structural check. All are now zero:
-
-| Defect | Count before | Root cause | Fix |
-|---|---|---|---|
-| `unbalanced_think` | 561 | Hermes sometimes emits a `<tool_call>` *inside* a `<think>` block, or leaves a stray `</think>` in prose | `canonicalize_assistant` extracts call blocks **first**, re-wraps think blocks, strips stray tags |
-| `tool_without_call` | 181 | tool results whose preceding call block failed to parse | unparseable calls are dropped, orphaned tool results are dropped with them |
-| `undeclared_tool` | 37 | tool names collected by scanning raw events, which miss calls nested in think blocks | names are collected from the **canonical** assistant turns |
-| `unbalanced_tool_call` | 23 | same malformed source rows | calls-first extraction |
-| `bad_tool_call_json` | 12 | `<parameter name=…>` / `name\narguments[k="v"]` dialects, and a `name` field that swallowed the rest of the message | `parse_call_payload` understands 3 dialects and validates the name against `[A-Za-z_][A-Za-z0-9_.-]{0,63}` |
-
-Two literals of `<think>` remain inside JSON **arguments** (a trace that
-explains the tag in a `memory` call). That is data, not structure; the
-validator reports it as a stat, not an error.
-
-The prep pipeline also became memory-safe: Open-SWE trajectories render to
-234 KB–1.3 MB each, so tokenisation batches are bounded by 6 MB of text and
-every conversation is cut at 90 k rendered characters (past that point no
-turn can fit `max_seq_len`, by construction).
