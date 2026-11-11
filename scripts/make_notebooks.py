@@ -324,9 +324,9 @@ GRAD_ACCUM = 8
 LR = 1e-4
 WEIGHT_DECAY = 0.01
 WARMUP = 60
-MAX_STEPS = 4000
+MAX_STEPS = 2050
 SAVE_EVERY = 100
-RUN_HOURS = 8.0
+RUN_HOURS = 10.0
 PAD_ID = 151643
 
 print(f"SEQ_LEN={SEQ_LEN} LR={LR} steps={MAX_STEPS} accum={GRAD_ACCUM}")
@@ -349,7 +349,8 @@ smoke = subprocess.run(
      "--model", MODEL, "--data", ARR_DIR, "--out", "/kaggle/working/smoke_out",
      "--seq-len", str(SEQ_LEN), "--pad-id", str(PAD_ID), "--batch", "1",
      "--grad-accum", "4", "--max-steps", "3", "--save-every", "1000",
-     "--run-hours", "0.4", "--attn", "sdpa", "--rank", str(LORA_R),
+     "--run-hours", "0.4", "--attn", "sdpa", "--grad-checkpoint", "1",
+     "--rank", str(LORA_R),
      "--alpha", str(LORA_ALPHA), "--dropout", str(LORA_DROPOUT), "--lr", str(LR)],
     capture_output=True, text=True)
 print(smoke.stdout[-8000:]); print(smoke.stderr[-4000:])
@@ -367,7 +368,7 @@ cmd = [
     "--seq-len", str(SEQ_LEN), "--pad-id", str(PAD_ID),
     "--batch", str(BATCH_PER_GPU), "--grad-accum", str(GRAD_ACCUM),
     "--max-steps", str(MAX_STEPS), "--save-every", str(SAVE_EVERY),
-    "--run-hours", str(RUN_HOURS), "--attn", "sdpa",
+    "--run-hours", str(RUN_HOURS), "--attn", "sdpa", "--grad-checkpoint", "1",
     "--rank", str(LORA_R), "--alpha", str(LORA_ALPHA), "--dropout", str(LORA_DROPOUT),
     "--lr", str(LR), "--weight-decay", str(WEIGHT_DECAY), "--warmup", str(WARMUP),
 ]
@@ -404,6 +405,7 @@ import torch, json, os, glob
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
+adapter_dir = globals().get("adapter_dir", "")
 if not os.path.isdir(adapter_dir):
     cands = sorted(glob.glob("/kaggle/working/train_out/checkpoints/step_*"))
     adapter_dir = cands[-1] if cands else ""
@@ -427,7 +429,7 @@ for p in prompts:
     msgs = [{"role": "system", "content": "You are a precise software engineering assistant."},
             {"role": "user", "content": p}]
     text = tok.apply_chat_template(msgs, tools=TOOLS, tokenize=False, add_generation_prompt=True)
-    ids = tok(text, return_tensors="pt").to("cuda:0")
+    ids = tok(text, return_tensors="pt", add_special_tokens=False).to("cuda:0")
     with torch.no_grad():
         out = model.generate(**ids, max_new_tokens=220, do_sample=False)
     print("="*70); print("PROMPT:", p); print("-"*70)
