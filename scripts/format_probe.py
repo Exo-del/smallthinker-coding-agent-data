@@ -167,7 +167,14 @@ def main():
                         tokenize=False, add_generation_prompt=True)
                     if len(tok(prompt, add_special_tokens=False)["input_ids"]) > 3000:
                         continue
-                    results.append(open_probe(f"corpus #{found}", prompt))
+                    label = f"corpus #{found}"
+                    results.append(open_probe(label, prompt))
+                    # Seed the close probe with the turn's *real* reasoning so the
+                    # in-distribution control measures both halves of the format.
+                    seed = extract_reasoning(conv["messages"][i].get("content", "")
+                                             if i < len(conv["messages"]) else "")
+                    if seed:
+                        results.append(close_probe(label, prompt, seed))
                     found += 1
                     if found >= 2:
                         break
@@ -190,15 +197,23 @@ def main():
     verdict = {k: {"opens_ok": opens[k]["starts_with_think"],
                    "closes_ok": closes.get(k, {}).get("starts_with_think_end")}
                for k in opens}
+    # only prompts that got *both* probes count; `closes_ok is None` means the
+    # close probe never ran (a corpus turn with no reasoning to seed from), which
+    # must not be reported as a failure.
+    measured = [k for k, v in verdict.items() if v["closes_ok"] is not None]
 
     with open(args.out, "w") as f:
         json.dump({"token_ids": ids, "summary": opens, "closes": closes,
-                   "verdict": verdict, "results": results}, f, indent=1)
+                   "verdict": verdict, "measured": measured,
+                   "results": results}, f, indent=1)
     print("\n=== SCORECARD ===")
     for k, v in verdict.items():
-        print(f"{k:>18}: opens={v['opens_ok']} closes={v['closes_ok']}")
-    n_ok = sum(1 for v in verdict.values() if v["opens_ok"] and v["closes_ok"])
-    print(f"fully well formed: {n_ok}/{len(verdict)}")
+        state = "-" if v["closes_ok"] is None else v["closes_ok"]
+        print(f"{k:>18}: opens={v['opens_ok']} closes={state}")
+    n_open = sum(1 for v in verdict.values() if v["opens_ok"])
+    n_ok = sum(1 for k in measured if verdict[k]["opens_ok"] and verdict[k]["closes_ok"])
+    print(f"opens ok:          {n_open}/{len(verdict)}")
+    print(f"fully well formed: {n_ok}/{len(measured)} (measured prompts)")
     print("wrote", args.out)
 
 
