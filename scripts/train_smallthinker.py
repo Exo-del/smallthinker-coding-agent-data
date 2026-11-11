@@ -229,6 +229,7 @@ def main():
     run_start = time.monotonic()
     deadline = run_start + max(0.05, args.run_hours) * 3600
     last_loss = 0.0
+    skipped_oom = 0
     stop = False
 
     def save_checkpoint(epoch, next_batch, label="step"):
@@ -260,35 +261,56 @@ def main():
             input_ids, attention_mask, labels = [t.to(device, non_blocking=True) for t in batch]
             do_sync = ((batch_idx + 1) % args.grad_accum == 0)
             sync_ctx = nullcontext() if (not distributed or do_sync) else model.no_sync()
-            with sync_ctx:
-                with autocast(dtype=torch.float16):
-                    # The supervised span is always the tail of the sequence, so
-                    # the LM head only needs to run over the target tokens.
-                    # With a 151,936-entry vocabulary this is the difference
-                    # between ~1.2 GiB and ~0.2 GiB of activation memory.
-                    counts = (labels != -100).sum(dim=1)
-                    n_target = int(counts.min().item())
-                    active = labels != -100
-                    tail_ok = False
-                    if n_target > 0 and bool((counts == counts.max()).item()):
-                        tail_ok = (bool(active[:, -n_target:].all().item())
-                                   and not bool(active[:, :-n_target].any().item()))
-                    if tail_ok:
-                        keep = n_target + 1
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                                        use_cache=False, return_dict=True,
-                                        logits_to_keep=keep)
-                        logits = outputs.logits[:, :-1, :].contiguous()
-                        shift_labels = labels[:, -n_target:].contiguous()
-                    else:
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                                        use_cache=False, return_dict=True)
-                        logits = outputs.logits[:, :-1, :].contiguous()
-                        shift_labels = labels[:, 1:].contiguous()
-                    loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
-                                           shift_labels.view(-1), ignore_index=-100)
-                    loss = loss / args.grad_accum
-                scaler.scale(loss).backward()
+            oom = False
+            try:
+                with sync_ctx:
+                    with autocast(dtype=torch.float16):
+                        # The supervised span is always the tail of the sequence,
+                        # so the LM head only needs to run over the target
+                        # tokens.  With a 151,936-entry vocabulary this is the
+                        # difference between ~1.2 GiB and ~0.2 GiB of
+                        # activation memory.
+                        counts = (labels != -100).sum(dim=1)
+                        n_target = int(counts.min().item())
+                        active = labels != -100
+                        tail_ok = False
+                        if n_target > 0 and bool((counts == counts.max()).item()):
+                            tail_ok = (bool(active[:, -n_target:].all().item())
+                                       and not bool(active[:, :-n_target].any().item()))
+                        if tail_ok:
+                            keep = n_target + 1
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                                            use_cache=False, return_dict=True,
+                                            logits_to_keep=keep)
+                            logits = outputs.logits[:, :-1, :].contiguous()
+                            shift_labels = labels[:, -n_target:].contiguous()
+                        else:
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                                            use_cache=False, return_dict=True)
+                            logits = outputs.logits[:, :-1, :].contiguous()
+                            shift_labels = labels[:, 1:].contiguous()
+                        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
+                                               shift_labels.view(-1), ignore_index=-100)
+                        loss = loss / args.grad_accum
+                    scaler.scale(loss).backward()
+            except torch.cuda.OutOfMemoryError:
+                # A single oversized example must not kill a 10-hour run.  Every
+                # rank has to agree to abandon the group, otherwise the
+                # allreduce in the next micro-step deadlocks.
+                oom = True
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+
+            if distributed:
+                flag = torch.tensor([1.0 if oom else 0.0], device=device)
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                oom = bool(flag.item() > 0)
+            if oom:
+                skipped_oom += 1
+                optimizer.zero_grad(set_to_none=True)
+                if is_main and skipped_oom % 10 == 1:
+                    print(f"skipped an oversized example (total {skipped_oom})", flush=True)
+                continue
 
             if not do_sync:
                 continue
@@ -342,6 +364,7 @@ def main():
             "train_examples": len(ds), "world_size": world_size,
             "lora_targets": ["q_proj", "k_proj", "v_proj", "o_proj"],
             "max_seq_len": args.seq_len,
+            "skipped_oom": skipped_oom,
         }, indent=2))
         print("Training segment finished. Adapter:", final_dir, flush=True)
     if distributed:

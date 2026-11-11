@@ -66,6 +66,12 @@ machine, that:
 
 Nothing here is saved as a dataset; this notebook only prints measurements.
 """),
+    code("""# Must precede any CUDA allocation.  With the default caching allocator the
+# 3072-token window fragments: the probe saw 2.98 GiB reserved-but-unallocated
+# while a 1.45 GiB block failed.  Expandable segments removes that class of OOM.
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+"""),
     code("""import os, sys, time, json, subprocess, shutil
 
 print("python:", sys.version)
@@ -196,7 +202,7 @@ def bench(seq_len, target_len, steps=6):
             "step_s": round(sum(times[2:])/max(1,len(times[2:])),3), "loss": round(float(loss),3)}
 
 results = []
-for seq, tgt in [(2048, 512), (3072, 512), (3072, 1536), (3072, 2560), (4096, 1536)]:
+for seq, tgt in [(3072, 2560), (3072, 2048), (3072, 1536), (3072, 512)]:
     try:
         r = bench(seq, tgt)
         results.append(r); print(r, flush=True)
@@ -242,6 +248,11 @@ it depended on live dataset streaming; shipping the data removes every moving
 part except the base model download.
 
 Pipeline: clone -> tokenise -> LoRA DDP over 2x T4 -> evaluate -> zip adapter.
+"""),
+    code("""# Must precede any CUDA allocation.  Without it the 3072-token window
+# fragments: 2.98 GiB reserved-but-unallocated while a 1.45 GiB block failed.
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 """),
     code("""import os, sys, time, json, subprocess, shutil, glob
 
