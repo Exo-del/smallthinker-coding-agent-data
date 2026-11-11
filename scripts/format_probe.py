@@ -38,6 +38,24 @@ TOOL_CALL = "<tool_call>"
 TOOL_END = "</" + "tool_call>"
 
 
+def extract_reasoning(text, max_chars=420):
+    """Pull the reasoning out of a corpus turn so the close probe is seeded with
+    in-distribution text instead of a synthetic sentence.
+
+    Returns "" when the turn has no think block, which makes the caller skip the
+    close probe rather than measure a bogus position.
+    """
+    i = text.find(THINK)
+    if i < 0:
+        return ""
+    j = text.find(THINK_END, i + len(THINK))
+    body = text[i + len(THINK): j if j >= 0 else None].strip()
+    if len(body) > max_chars:
+        cut = body[:max_chars]
+        body = cut.rsplit(" ", 1)[0] if " " in cut else cut
+    return body
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
