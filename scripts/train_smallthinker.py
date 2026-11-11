@@ -48,6 +48,20 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--attn", default="sdpa")
     p.add_argument("--grad-checkpoint", type=int, default=1)
+    p.add_argument("--target-modules", default="q_proj,k_proj,v_proj,o_proj",
+                   help="comma list of LoRA target module suffixes; add embed_tokens,lm_head "
+                        "to let rare structural tokens move their own row directly")
+    p.add_argument("--init-adapter", default="",
+                   help="adapter directory whose weights are loaded into the fresh LoRA "
+                        "before training (matching keys only) - used to continue a run with "
+                        "a wider target set")
+    p.add_argument("--tag-weight", type=float, default=1.0,
+                   help="loss weight for structural tokens (see --tag-ids); 1.0 disables")
+    p.add_argument("--tag-ids", default="151667,151668,151657,151658,151665,151666,151645",
+                   help="comma list of token ids that carry a different loss weight")
+    p.add_argument("--first-target-weight", type=float, default=1.0,
+                   help="loss weight for the first --first-target-k target tokens of a turn")
+    p.add_argument("--first-target-k", type=int, default=0)
     return p.parse_args()
 
 
@@ -169,12 +183,33 @@ def main():
         if is_main: print("Loading trainable adapter:", args.resume, flush=True)
         model = PeftModel.from_pretrained(base, args.resume, is_trainable=True)
     else:
+        targets = [t.strip() for t in args.target_modules.split(",") if t.strip()]
         cfg = LoraConfig(
             r=args.rank, lora_alpha=args.alpha, lora_dropout=args.dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=targets,
             bias="none", task_type="CAUSAL_LM",
         )
         model = get_peft_model(base, cfg)
+        if is_main:
+            print("LoRA targets:", targets, flush=True)
+        if args.init_adapter:
+            # Widening the target set must not throw away an existing adapter:
+            # copy every key that still matches and leave the rest at PEFT's
+            # zero-init (so the new modules start as a no-op).
+            from safetensors.torch import load_file
+            from peft import set_peft_model_state_dict
+            ckpt = Path(args.init_adapter) / "adapter_model.safetensors"
+            if not ckpt.exists():
+                ckpt = Path(args.init_adapter) / "adapter_model.bin"
+            sd = load_file(str(ckpt)) if ckpt.suffix == ".safetensors" else torch.load(str(ckpt), map_location="cpu")
+            if is_main:
+                print(f"init adapter: {len(sd)} tensors from {ckpt}", flush=True)
+            try:
+                res = set_peft_model_state_dict(model, sd, strict=False)
+            except TypeError:
+                res = set_peft_model_state_dict(model, sd)
+            if is_main:
+                print("init adapter load result:", res, flush=True)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
@@ -226,6 +261,12 @@ def main():
         raise RuntimeError(f"Not enough batches ({len(loader)}) for grad_accum={args.grad_accum}.")
 
     optimizer.zero_grad(set_to_none=True)
+    tag_ids_t = torch.tensor([int(x) for x in args.tag_ids.split(",") if x.strip()],
+                             device=device, dtype=torch.long)
+    tag_w = float(args.tag_weight)
+    first_w = float(args.first_target_weight)
+    loss_for_log = torch.tensor(0.0, device=device)
+    tag_ce_for_log = torch.tensor(float("nan"), device=device)
     run_start = time.monotonic()
     deadline = run_start + max(0.05, args.run_hours) * 3600
     last_loss = 0.0
@@ -289,8 +330,30 @@ def main():
                                             use_cache=False, return_dict=True)
                             logits = outputs.logits[:, :-1, :].contiguous()
                             shift_labels = labels[:, 1:].contiguous()
-                        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
-                                               shift_labels.view(-1), ignore_index=-100)
+                        ce = F.cross_entropy(logits.view(-1, logits.shape[-1]),
+                                             shift_labels.view(-1),
+                                             ignore_index=-100, reduction="none").view(shift_labels.shape)
+                        sup = shift_labels != -100
+                        n_sup = sup.sum().clamp(min=1)
+                        loss_for_log = ce.sum() / n_sup
+                        tag_pos = torch.isin(shift_labels, tag_ids_t) if tag_ids_t.numel() else None
+                        if tag_pos is not None and bool(tag_pos.any().item()):
+                            tag_ce_for_log = (ce * tag_pos).sum() / tag_pos.sum()
+                        if tag_w != 1.0 or first_w != 1.0:
+                            # Structural tokens (`<think>` / `<tool_call>` ...) occur once
+                            # per turn, i.e. ~0.4 % of supervised tokens, so a plain mean
+                            # barely trains them: v1 finished with p(<think>) still at rank
+                            # ~10,000 even though 73 % of turns open with it.
+                            w = sup.to(torch.float32)
+                            if tag_w != 1.0 and tag_pos is not None:
+                                w = torch.where(tag_pos, torch.full_like(w, tag_w), w)
+                            if first_w != 1.0 and args.first_target_k > 0:
+                                head = (torch.cumsum(sup.to(torch.int32), dim=1)
+                                        <= args.first_target_k) & sup
+                                w = torch.where(head, torch.full_like(w, first_w), w)
+                            loss = (ce * w).sum() / w.sum().clamp(min=1.0)
+                        else:
+                            loss = loss_for_log
                         loss = loss / args.grad_accum
                     scaler.scale(loss).backward()
             except torch.cuda.OutOfMemoryError:
@@ -321,14 +384,16 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             global_step += 1
-            last_loss = float(loss.detach().cpu()) * args.grad_accum
+            last_loss = float(loss_for_log.detach().cpu())
             next_batch = batch_idx + 1
 
             if is_main and global_step % 10 == 0:
                 elapsed = (time.monotonic() - run_start) / 3600
                 lr = scheduler.get_last_lr()[0]
                 mem = torch.cuda.max_memory_allocated(local_rank) / 1024**3
-                print(f"step={global_step} loss~={last_loss:.4f} lr={lr:.2e} elapsed_h={elapsed:.2f} peak_gib={mem:.2f}", flush=True)
+                print(f"step={global_step} loss~={last_loss:.4f} "
+                      f"tagce~={float(tag_ce_for_log):.4f} lr={lr:.2e} "
+                      f"elapsed_h={elapsed:.2f} peak_gib={mem:.2f}", flush=True)
 
             need_save = (global_step % args.save_every == 0) or (time.monotonic() >= deadline) or (global_step >= args.max_steps)
             if need_save:
@@ -360,10 +425,16 @@ def main():
         }, final_dir / "training_state.pt")
         (out_dir / "run_summary.json").write_text(json.dumps({
             "global_step": global_step, "last_loss": last_loss,
+            "last_tag_ce": float(tag_ce_for_log),
             "elapsed_hours": (time.monotonic() - run_start) / 3600,
             "train_examples": len(ds), "world_size": world_size,
-            "lora_targets": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "lora_targets": [t.strip() for t in args.target_modules.split(",") if t.strip()],
+            "lora_rank": args.rank, "lora_alpha": args.alpha,
             "max_seq_len": args.seq_len,
+            "tag_weight": args.tag_weight, "tag_ids": args.tag_ids,
+            "first_target_k": args.first_target_k,
+            "first_target_weight": args.first_target_weight,
+            "init_adapter": args.init_adapter,
             "skipped_oom": skipped_oom,
         }, indent=2))
         print("Training segment finished. Adapter:", final_dir, flush=True)
